@@ -3,7 +3,7 @@
 Reconstructed from the official MMLNet data_utils.py (github.com/qianngli/MMLNet,
 commit 6809f21), which BRENet was built on. Differences from that file:
   * the dataset root comes from --data_root (train.py/test.py also search ./datasets,
-    ../datasets); the old hard-coded '/data/liqiang/<dataset>' is only a last fallback;
+    ../datasets);
   * IRSTD-1k split lists come from the package (splits/, chosen by --split); ids may be
     written with or without the extension, and every image/mask path is checked once;
   * single-channel 'L' masks are supported (the original cvtColor(RGB2BGR) on masks
@@ -158,7 +158,7 @@ class DatasetLoader(Data.Dataset):
             raise ValueError('Unknown mode %s' % mode)
         self.dataset = args.dataset
         self.mode = mode
-        base_dir = getattr(args, 'data_root', '') or osp.join('/data/liqiang', self.dataset)
+        base_dir = getattr(args, 'data_root', '')
         if not osp.isdir(base_dir):
             raise FileNotFoundError('dataset root not found: %s (set --data_root)' % base_dir)
 

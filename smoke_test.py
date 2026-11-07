@@ -106,7 +106,7 @@ def test_model_and_loss(device):
 
 def test_old_checkpoint(path, device):
     net = ISNet(channels=(16, 32, 64, 128)).to(device)
-    state = torch.load(path, map_location=device)
+    state = torch.load(path, map_location=device, weights_only=True)
     state = state.get('state_dict', state) if isinstance(state, dict) else state
     state = {k.replace('module.', '', 1): v for k, v in state.items()}
     net.load_state_dict(state, strict=True)

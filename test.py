@@ -71,7 +71,7 @@ def load_run(run_dir, checkpoint, device):
         with open(config_path, 'r', encoding='utf-8') as handle:
             config = json.load(handle)
     net = build_model(config, device)
-    state = torch.load(ops.join(run_dir, 'checkpoints', checkpoint), map_location=device)
+    state = torch.load(ops.join(run_dir, 'checkpoints', checkpoint), map_location=device, weights_only=True)
     if isinstance(state, dict) and 'state_dict' in state:
         state = state['state_dict']
     state = {key.replace('module.', '', 1): value for key, value in state.items()}
