@@ -1,4 +1,4 @@
-# Python >= 3.8 (workstation: 3.8). Install PyTorch/torchvision for your CUDA version first (pytorch.org).
+# Python >= 3.8. Install PyTorch/torchvision for your CUDA version first (pytorch.org).
 torch
 torchvision
 numpy
