@@ -1,1 +1,9 @@
+# Python >= 3.8 (workstation: 3.8). Install PyTorch/torchvision for your CUDA version first (pytorch.org).
 torch
+torchvision
+numpy
+opencv-python
+pillow
+tqdm
+albumentations
+pytorch_wavelets   # Haar downsampling inherited from MMLNet; without it an AvgPool fallback changes the model

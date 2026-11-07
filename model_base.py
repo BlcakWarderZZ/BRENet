@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
-"""MMLNet-derived infrared small-target detector rebuilt with BREB.
+"""BRENet: infrared small-target detector built on the MMLNet dual-branch topology.
 
 BREB (Background-Referenced Evidence Block) replaces the ordinary residual
-processing rule throughout the detection encoder, structural encoder, decoder,
-prior encoder, and final fusion.  Every spatial response is judged against an
-annular local-background distribution before it is allowed to update the
-identity path:
+processing rule at ten stage interfaces of the detection encoder, structural
+encoder and decoder.  Every spatial response is judged against an annular
+local-background distribution before it is allowed to update the identity path:
 
     projection -> annular reference -> dispersion standardization
     -> exceedance selection -> complementary reconstruction -> residual update
 
-The original topology is retained so ``deployment='none'`` supplies a clean
-ResidualBlock control.  The proposed ``full`` model inserts one BREB at each
-of ten task-critical stage interfaces; ``dense`` keeps the all-block
-replacement as an explicit over-deployment control.  JEPF then replaces
-decoder additions with a repeated deep/middle/shallow joint-evidence
-partition based on cross-source agreement, while ``fusion_mode='legacy'``
-preserves the inherited fusion.
+JEPF (Joint-Evidence Partition Fusion, ``fusion_mode='partition'``) replaces the
+decoder additions with a deep/middle/shallow joint-evidence partition; HEAL (loss.py)
+supervises the JEPF evidence states during training.
+Controls: ``deployment='none'`` (no BREB), ``fusion_mode='legacy'`` (MMLNet fusion),
+``fusion_mode='uniform'`` (JEPF graph with equal states).
 """
 
 import math
@@ -92,8 +89,10 @@ class BackgroundReferencedBlock(nn.Module):
     discrimination at every hierarchy level.
     """
     def __init__(self, in_channels, out_channels, stride=1, outer_size=5, guard_size=1,
-                 evidence_mode='positive'):
+                 evidence_mode='positive', tau_init=1.0, alpha_init=0.1):
         super().__init__()
+        if tau_init <= 0.0 or not 0.0 < alpha_init < 1.0:
+            raise ValueError('BREB requires tau_init > 0 and 0 < alpha_init < 1')
         self.outer_size = int(outer_size)
         self.guard_size = int(guard_size)
         if evidence_mode not in {'positive', 'symmetric'}:
@@ -122,11 +121,13 @@ class BackgroundReferencedBlock(nn.Module):
             _norm(out_channels),
         )
         self.threshold_raw = nn.Parameter(
-            torch.full((1, out_channels, 1, 1), _inverse_softplus(1.0))
+            torch.full((1, out_channels, 1, 1), _inverse_softplus(tau_init))
         )
         self.sharpness_raw = nn.Parameter(torch.tensor(_inverse_softplus(2.0)))
         # The network starts close to its identity adapter and learns safe updates.
-        self.residual_scale_logit = nn.Parameter(torch.tensor(-2.1972246))
+        # The literal keeps the default (alpha_init=0.1) bit-identical to the original code.
+        alpha_logit = -2.1972246 if alpha_init == 0.1 else math.log(alpha_init / (1.0 - alpha_init))
+        self.residual_scale_logit = nn.Parameter(torch.tensor(alpha_logit))
 
     def forward(self, x):
         identity = self.skip(x)
@@ -450,18 +451,32 @@ def white_tophat(x, kernel_size):
 
 
 class ISNet(nn.Module):
-    """MMLNet topology rebuilt with BREB processing and JEPF reconstruction."""
+    """MMLNet dual-branch topology with BREB and JEPF."""
     VALID_DEPLOYMENTS = {
         'none', 'shallow', 'middle', 'deep', 'encoder', 'decoder', 'full', 'dense'
     }
+    # partition = JEPF (BRENet); legacy = MMLNet fusion (control); uniform = JEPF graph
+    # with equal states (computation-matched control).
     VALID_FUSIONS = {'legacy', 'partition', 'uniform'}
+    # (outer, guard) per level; 'default' is the configuration of the paper.
+    WINDOW_PRESETS = {
+        'default': {'shallow': (7, 3), 'middle': (5, 1), 'deep': (3, 1)},
+        'narrow': {'shallow': (5, 3), 'middle': (3, 1), 'deep': (3, 1)},
+        'wide': {'shallow': (9, 3), 'middle': (7, 1), 'deep': (5, 1)},
+    }
     VALID_FUSION_SCOPES = {
         'deep', 'middle', 'shallow', 'deep_middle', 'middle_shallow', 'full'
     }
     def __init__(self, layer_blocks=None, channels=(16, 32, 64, 128),
                  deployment='full', stage_repeat=1, evidence_mode='positive',
-                 fusion_mode='partition', fusion_scope='full'):
+                 fusion_mode='partition', fusion_scope='full',
+                 breb_windows='default', breb_tau_init=1.0, breb_alpha_init=0.1):
         super().__init__()
+        if breb_windows not in self.WINDOW_PRESETS:
+            raise ValueError('breb_windows must be one of %s' % sorted(self.WINDOW_PRESETS))
+        self.breb_windows = breb_windows
+        self.breb_tau_init = float(breb_tau_init)
+        self.breb_alpha_init = float(breb_alpha_init)
         if deployment not in self.VALID_DEPLOYMENTS:
             raise ValueError('deployment must be one of %s' % sorted(self.VALID_DEPLOYMENTS))
         self.deployment = deployment
@@ -552,16 +567,17 @@ class ISNet(nn.Module):
                     return 'uniform'
                 return 'evidence'
 
+            def fusion_args(level):
+                return dict(partition_mode=partition_mode(level))
+
             self.fusion_deep = JointEvidencePartitionFusion(
-                (c4,), (c4,), c4, partition_mode=partition_mode('deep'),
+                (c4,), (c4,), c4, **fusion_args('deep'),
             )
             self.fusion_middle = JointEvidencePartitionFusion(
-                (c4, c4, c3, c3), (c4, c4), c3,
-                partition_mode=partition_mode('middle'),
+                (c4, c4, c3, c3), (c4, c4), c3, **fusion_args('middle'),
             )
             self.fusion_shallow = JointEvidencePartitionFusion(
-                (c3, c3, c2, c4), (c3, c3), c2,
-                partition_mode=partition_mode('shallow'),
+                (c3, c3, c2, c4), (c3, c3), c2, **fusion_args('shallow'),
             )
         self.uplayer2 = self._make_layer(
             2, c4, c4, level='deep', scope='decoder', core=True
@@ -583,7 +599,8 @@ class ISNet(nn.Module):
         self.prior_fuse2 = self._make_layer(2, 3, 3, level='shallow', scope='encoder')
 
         # The same block also defines the final multi-source fusion interface.
-        self.tail_fusion = self._make_layer(1, c2 * 3 + 3, c2, level='shallow', scope='decoder')
+        self.tail_fusion = self._make_layer(1, c2 * 3 + 3, c2,
+                                            level='shallow', scope='decoder')
         self.unit = Unit(c2)
         self.end = _FCNHead(c2, 1)
         self.aux_deep = nn.Conv2d(c4, 1, 1)
@@ -601,9 +618,8 @@ class ISNet(nn.Module):
             (d == 'decoder' and scope == 'decoder')
         )
 
-    @staticmethod
-    def _ring_for_level(level):
-        return {'shallow': (7, 3), 'middle': (5, 1), 'deep': (3, 1)}[level]
+    def _ring_for_level(self, level):
+        return self.WINDOW_PRESETS[self.breb_windows][level]
 
     def _make_layer(self, block_num, in_channels, out_channels, level, scope, core=False):
         use_reference = self._use_reference(level, scope, core)
@@ -619,7 +635,8 @@ class ISNet(nn.Module):
             )
             return nn.Sequential(*layers)
 
-        breb_args = dict(common, evidence_mode=self.evidence_mode)
+        breb_args = dict(common, evidence_mode=self.evidence_mode,
+                         tau_init=self.breb_tau_init, alpha_init=self.breb_alpha_init)
         # ``dense`` reproduces the former all-block replacement.  The proposed
         # modes expose one deep module at each selected seam and retain ordinary
         # residual adapters for any remaining depth in that stage.
@@ -767,7 +784,8 @@ class ISNet(nn.Module):
 
         local = self.ccfe(edge_prob, rec_main)
         local = self.pixel_shuffle(self.fuse_local(local))
-        fused = self.tail_fusion(torch.cat([rec_main, local, edge_full, prior], dim=1))
+        tail_inputs = [rec_main, local, edge_full, prior]
+        fused = self.tail_fusion(torch.cat(tail_inputs, dim=1))
         logits = self.end(self.unit(fused))
 
         original_h, original_w = original_size
@@ -793,5 +811,5 @@ if __name__ == '__main__':
     with torch.no_grad():
         y, edge, aux, evidence = net(x, return_aux=True)
     print('logits:', y.shape, 'edge:', edge.shape, 'aux:', [z.shape for z in aux])
-    print('HEAL evidence:', sorted(evidence))
+    print('JEPF evidence levels:', sorted(evidence), '| BREB blocks:', net.reference_block_count)
     print('BREB blocks:', net.reference_block_count)

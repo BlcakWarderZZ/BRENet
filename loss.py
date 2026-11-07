@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Losses aligned with the background-referenced representation in BREBNet."""
+"""BRENet losses: segmentation, deep supervision, edge, BREB reference term, HEAL and TBS."""
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -241,6 +243,77 @@ class HierarchicalEvidenceAttribution(nn.Module):
         }
 
 
+class TargetBalancedSupervision(nn.Module):
+    """TBS: every ground-truth target contributes equally to the loss.
+
+    Measured on IRSTD-1k: detectors miss targets far more often in images that contain several
+    targets (Pd 0.80-0.86 vs 0.94-0.95 for BRENet variants; 0.84-0.91 vs 0.90-0.95 for seven
+    published detectors), and the baseline misses 11% of such targets even on its TRAINING images.
+    Pixel-level BCE/Dice weight a target by its share of the batch's pixels, so once the dominant
+    target is fitted a secondary target receives almost no gradient, while Pd counts every target.
+
+    For each connected target T_k, its window W_k is T_k plus its local background ring
+    (dilation by ``context`` px, other targets excluded).  The loss is the mean over all targets
+    of 1 - softIoU_k, with softIoU_k = sum(p T_k) / sum_{W_k}(p + T_k - p T_k): a missed target
+    costs 1 whatever its size or the number of targets in its image, and spill into the target's
+    own background ring is penalised in the same term.
+    """
+    def __init__(self, context=4, eps=1e-6, false_alarm=False):
+        super().__init__()
+        if context < 0:
+            raise ValueError('TBS context must be >= 0')
+        self.context = int(context)
+        self.eps = float(eps)
+        # Optional object-level counterpart for false alarms (off by default): every predicted
+        # component (p >= 0.5) that lies outside all target windows is one more unit of the loss,
+        # its mean binary cross-entropy towards background, so each false-alarm component counts
+        # once regardless of its area -- the way Fa counts unmatched components.
+        self.false_alarm = bool(false_alarm)
+
+    def _false_alarm_terms(self, logits, binary_np, index, kernel):
+        guard = cv2.dilate(binary_np, np.ones((kernel, kernel), np.uint8)) if self.context else binary_np
+        pred = (torch.sigmoid(logits[index, 0]).detach() >= 0.5).cpu().numpy().astype(np.uint8)
+        pred[guard > 0] = 0
+        count, labels = cv2.connectedComponents(pred, connectivity=8)
+        if count <= 1:
+            return None
+        # Per-component mean by scatter over the label map: memory O(H*W), independent of the
+        # number of components (early in training the thresholded output has thousands of them).
+        labels = torch.from_numpy(labels.astype(np.int64)).to(logits.device).view(-1)
+        bce = F.softplus(logits[index, 0]).reshape(-1)                           # -log(1 - p)
+        sums = bce.new_zeros(count).scatter_add(0, labels, bce)
+        sizes = torch.bincount(labels, minlength=count).to(bce.dtype)
+        return sums[1:] / sizes[1:].clamp_min(1.0)
+
+    def forward(self, logits, target):
+        probability = torch.sigmoid(logits)
+        binary = (target > 0.5)
+        masks = binary.detach().cpu().numpy().astype(np.uint8)
+        kernel = 2 * self.context + 1
+        terms = []
+        for index in range(masks.shape[0]):
+            if self.false_alarm:
+                fa = self._false_alarm_terms(logits, masks[index, 0], index, kernel)
+                if fa is not None:
+                    terms.append(fa)
+            count, labels = cv2.connectedComponents(masks[index, 0], connectivity=8)
+            if count <= 1:
+                continue
+            labels = torch.from_numpy(labels.astype(np.int64)).to(logits.device)
+            ids = torch.arange(1, count, device=logits.device).view(-1, 1, 1)
+            objects = (labels.unsqueeze(0) == ids).unsqueeze(1).to(probability.dtype)   # (K,1,H,W)
+            windows = F.max_pool2d(objects, kernel, stride=1, padding=self.context) if self.context else objects
+            others = (binary[index:index + 1].to(probability.dtype) - objects).clamp(0.0, 1.0)
+            windows = windows * (1.0 - others)
+            p = probability[index:index + 1]
+            inter = (p * objects).sum(dim=(1, 2, 3))
+            union = ((p + objects - p * objects) * windows).sum(dim=(1, 2, 3))
+            terms.append(1.0 - inter / (union + self.eps))
+        if not terms:
+            return logits.sum() * 0.0
+        return torch.cat(terms).mean()
+
+
 class BackgroundReferenceLoss(nn.Module):
     """Supervise segmentation, BREB representation, and JEPF attribution.
 
@@ -279,6 +352,9 @@ class BackgroundReferenceLoss(nn.Module):
         heal_ramp_start=20,
         heal_ramp_end=80,
         use_heal=True,
+        w_tbs=0.0,
+        tbs_context=4,
+        tbs_false_alarm=False,
     ):
         super().__init__()
         if outer_size <= guard_size or outer_size % 2 == 0 or guard_size % 2 == 0:
@@ -301,6 +377,9 @@ class BackgroundReferenceLoss(nn.Module):
         self.use_heal = bool(use_heal)
         self.heal_ramp_start = int(heal_ramp_start)
         self.heal_ramp_end = int(heal_ramp_end)
+        # Target-Balanced Supervision (0 = off).
+        self.w_tbs = float(w_tbs)
+        self.tbs = TargetBalancedSupervision(context=tbs_context, false_alarm=tbs_false_alarm)
         self.heal = HierarchicalEvidenceAttribution(
             scope=heal_scope,
             mining=heal_mining,
@@ -394,8 +473,11 @@ class BackgroundReferenceLoss(nn.Module):
         if self.use_heal and self.w_heal > 0.0 and evidence_pyramid:
             heal = self.heal(logits, target, evidence_pyramid)
 
+        tbs = self.tbs(logits, target) if self.w_tbs > 0.0 else logits.new_zeros(())
+
         total = (
             total_final
+            + self.w_tbs * tbs
             + self.w_aux * aux_loss
             + self.w_edge * edge_loss
             + self.w_reference * ramp * reference_loss
@@ -418,6 +500,7 @@ class BackgroundReferenceLoss(nn.Module):
             'heal_hard_pixels': heal['hard_pixels'],
             'heal_persistent_score': heal['persistent_score'],
             'heal_ramp': logits.new_tensor(heal_ramp),
+            'tbs': tbs,
         }
 
 
